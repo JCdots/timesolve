@@ -1,464 +1,319 @@
 import os
-import json
+import sqlite3
 import datetime
+import time
 from typing import Optional, List, Dict, Any, Tuple
-from collections import defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from glpi_methods import authenticate_glpi, get_ticket_subitems, kill_session
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Environment Configuration
+# ============================================================================
+# Configuration
+# ============================================================================
 GLPI_URL = os.getenv("DEFAULT_GLPI_URL")
 APP_TOKEN = os.getenv("DEFAULT_APP_TOKEN")
 USER = os.getenv("DEFAULT_USER")
 PASSWORD = os.getenv("DEFAULT_PASS")
 
-# Business Configuration
-TICKET_ID = 3
-TARGET_GROUP_ID = 1
-OBSERVER_TYPE = 3
-
-# Constants
+DB_FILENAME = "glpi_timesolve.db"
 GROUP_ASSIGNED_ACTION = 15
 GROUP_UNASSIGNED_ACTION = 16
 GLPI_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
-DISPLAY_DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
 
+# ============================================================================
+# Data Structures
+# ============================================================================
 
 @dataclass
 class GroupInfo:
-    """Represents a group with its ID and name."""
     id: int
     name: str = "Unknown"
-    
-    def __str__(self):
-        return f"{self.name} ({self.id})"
-    
-    def __hash__(self):
-        return hash(self.id)
-
 
 @dataclass
 class AssignmentPeriod:
-    """Represents a single assignment period."""
     assigned: datetime.datetime
     unassigned: datetime.datetime
     duration: datetime.timedelta
     still_assigned: bool = False
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            'assigned': self.assigned.isoformat(),
-            'unassigned': self.unassigned.isoformat(),
-            'duration_seconds': self.duration.total_seconds(),
-            'still_assigned': self.still_assigned
-        }
 
+# ============================================================================
+# Database Management
+# ============================================================================
+
+class DatabaseManager:
+    """Handles storage of analysis results into SQLite."""
+    
+    def __init__(self, db_name=DB_FILENAME):
+        self.db_name = db_name
+        self.conn = None
+        self.init_db()
+
+    def connect(self):
+        self.conn = sqlite3.connect(self.db_name)
+        self.conn.row_factory = sqlite3.Row
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+    def init_db(self):
+        """Create necessary tables if they don't exist."""
+        self.connect()
+        cursor = self.conn.cursor()
+        
+        # Table to track which tickets we've processed
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS processed_tickets (
+                ticket_id INTEGER PRIMARY KEY,
+                processed_at TIMESTAMP,
+                status TEXT,
+                error_message TEXT
+            )
+        ''')
+
+        # Table to store the summary time for each group per ticket
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS group_durations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER,
+                group_id INTEGER,
+                group_name TEXT,
+                total_seconds REAL,
+                assignment_count INTEGER,
+                FOREIGN KEY(ticket_id) REFERENCES processed_tickets(ticket_id)
+            )
+        ''')
+
+        # Table to store detailed periods (start/end times)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS assignment_periods (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER,
+                group_id INTEGER,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                duration_seconds REAL,
+                still_assigned BOOLEAN,
+                FOREIGN KEY(ticket_id) REFERENCES processed_tickets(ticket_id)
+            )
+        ''')
+        
+        self.conn.commit()
+
+    def is_ticket_processed(self, ticket_id: int) -> bool:
+        """Check if a ticket has already been successfully processed."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT 1 FROM processed_tickets WHERE ticket_id = ? AND status = 'SUCCESS'", (ticket_id,))
+        return cursor.fetchone() is not None
+
+    def save_results(self, ticket_id: int, results: Dict[int, Dict[str, Any]]):
+        """Save analysis results for a single ticket."""
+        cursor = self.conn.cursor()
+        now = datetime.datetime.now().isoformat()
+
+        try:
+            # 1. Record successful processing
+            cursor.execute('''
+                INSERT OR REPLACE INTO processed_tickets (ticket_id, processed_at, status, error_message)
+                VALUES (?, ?, 'SUCCESS', NULL)
+            ''', (ticket_id, now))
+
+            # 2. Clear old data for this ticket (to allow re-runs)
+            cursor.execute("DELETE FROM group_durations WHERE ticket_id = ?", (ticket_id,))
+            cursor.execute("DELETE FROM assignment_periods WHERE ticket_id = ?", (ticket_id,))
+
+            # 3. Insert new data
+            for group_id, data in results.items():
+                group_info = data['group_info']
+                
+                # Insert Summary
+                cursor.execute('''
+                    INSERT INTO group_durations (ticket_id, group_id, group_name, total_seconds, assignment_count)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (ticket_id, group_id, group_info.name, data['total_duration'].total_seconds(), data['assignment_count']))
+
+                # Insert Details
+                for period in data['periods']:
+                    cursor.execute('''
+                        INSERT INTO assignment_periods (ticket_id, group_id, start_time, end_time, duration_seconds, still_assigned)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (
+                        ticket_id, 
+                        group_id, 
+                        period.assigned.isoformat(), 
+                        period.unassigned.isoformat(), 
+                        period.duration.total_seconds(), 
+                        period.still_assigned
+                    ))
+            
+            self.conn.commit()
+            
+        except Exception as e:
+            self.conn.rollback()
+            print(f"DB Error saving ticket {ticket_id}: {e}")
+            raise
+
+    def log_error(self, ticket_id: int, error_msg: str):
+        """Log a failed ticket processing attempt."""
+        cursor = self.conn.cursor()
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+            INSERT OR REPLACE INTO processed_tickets (ticket_id, processed_at, status, error_message)
+            VALUES (?, ?, 'ERROR', ?)
+        ''', (ticket_id, now, str(error_msg)))
+        self.conn.commit()
+
+    def get_max_processed_id(self) -> int:
+        """Get the highest ticket ID processed so far."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT MAX(ticket_id) FROM processed_tickets")
+        result = cursor.fetchone()[0]
+        return result if result else 0
+
+# ============================================================================
+# Core Logic
+# ============================================================================
 
 class GLPISession:
-    """Context manager for GLPI API sessions with automatic cleanup."""
-    
-    def __init__(self, url: str, user: str, password: str, app_token: Optional[str] = None):
-        self.url = url
-        self.user = user
-        self.password = password
-        self.app_token = app_token
+    def __init__(self, url, user, password, app_token=None):
+        self.url, self.user, self.password, self.app_token = url, user, password, app_token
         self.session_token = None
-    
     def __enter__(self):
-        self.session_token, error = authenticate_glpi(
-            self.url,
-            login=self.user,
-            password=self.password,
-            app_token=self.app_token
-        )
-        if not self.session_token:
-            raise ConnectionError(f"Authentication failed: {error}")
+        self.session_token, err = authenticate_glpi(self.url, login=self.user, password=self.password, app_token=self.app_token)
+        if not self.session_token: raise ConnectionError(f"Auth failed: {err}")
         return self.session_token
-    
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.session_token:
-            kill_session(self.url, self.session_token, app_token=self.app_token)
+        if self.session_token: kill_session(self.url, self.session_token, app_token=self.app_token)
 
-
-# ============================================================================
-# Date/Time Utilities
-# ============================================================================
-
-def parse_glpi_date(date_str: str) -> datetime.datetime:
-    """Parse GLPI date string to datetime object."""
+def parse_glpi_date(date_str):
     return datetime.datetime.strptime(date_str, GLPI_DATE_FORMAT)
 
-
-def format_datetime(dt: datetime.datetime) -> str:
-    """Format datetime for human-readable display."""
-    return dt.strftime(DISPLAY_DATE_FORMAT)
-
-
-def get_current_time() -> datetime.datetime:
-    """Get current time without microseconds."""
-    return datetime.datetime.now().replace(microsecond=0)
-
-
-# ============================================================================
-# Log Parsing Utilities
-# ============================================================================
-
-def extract_group_info_from_value(value: str) -> Optional[GroupInfo]:
-    """
-    Extract group ID and name from GLPI log value.
-    
-    Format: "GroupName (123)" -> GroupInfo(id=123, name="GroupName")
-    """
-    if not value or not value.strip():
-        return None
-    
+def extract_group_info(value: str) -> Optional[GroupInfo]:
+    if not value: return None
     try:
-        start = value.rfind('(')
-        end = value.rfind(')')
-        
-        if start != -1 and end != -1 and start < end:
-            group_id = int(value[start + 1:end])
-            group_name = value[:start].strip()
-            return GroupInfo(id=group_id, name=group_name)
-    except (ValueError, AttributeError):
-        pass
-    
+        start, end = value.rfind('('), value.rfind(')')
+        if start < end and start != -1:
+            return GroupInfo(id=int(value[start+1:end]), name=value[:start].strip())
+    except: pass
     return None
 
-
-def is_assignment_log(log: Dict[str, Any], group_id: int) -> bool:
-    """Check if log entry is an assignment for the specified group."""
-    if log.get('itemtype_link') != 'Group':
-        return False
+def calculate_ticket_times(logs: List[Dict]) -> Dict[int, Dict]:
+    """Process logs in memory to calculate durations."""
+    # Sort once
+    logs.sort(key=lambda x: x['date_mod'])
     
-    if int(log.get('linked_action', 0)) != GROUP_ASSIGNED_ACTION:
-        return False
-    
-    group_info = extract_group_info_from_value(log.get('new_value', ''))
-    return group_info and group_info.id == group_id
-
-
-def is_unassignment_log(log: Dict[str, Any], group_id: int) -> bool:
-    """Check if log entry is an unassignment for the specified group."""
-    if log.get('itemtype_link') != 'Group':
-        return False
-    
-    if int(log.get('linked_action', 0)) != GROUP_UNASSIGNED_ACTION:
-        return False
-    
-    group_info = extract_group_info_from_value(log.get('old_value', ''))
-    return group_info and group_info.id == group_id
-
-
-def get_all_groups_from_logs(logs: List[Dict[str, Any]]) -> Dict[int, GroupInfo]:
-    """Extract all unique groups mentioned in logs."""
-    groups = {}
+    group_states = {} # {group_id: {'start': datetime, 'periods': [], 'info': GroupInfo}}
     
     for log in logs:
-        if log.get('itemtype_link') != 'Group':
-            continue
+        if log.get('itemtype_link') != 'Group': continue
         
-        linked_action = int(log.get('linked_action', 0))
+        action = int(log.get('linked_action', 0))
         
-        # Check assignment
-        if linked_action == GROUP_ASSIGNED_ACTION:
-            group_info = extract_group_info_from_value(log.get('new_value', ''))
-        # Check unassignment
-        elif linked_action == GROUP_UNASSIGNED_ACTION:
-            group_info = extract_group_info_from_value(log.get('old_value', ''))
-        else:
-            continue
-        
-        if group_info and group_info.id not in groups:
-            groups[group_info.id] = group_info
-    
-    return groups
+        if action == GROUP_ASSIGNED_ACTION:
+            info = extract_group_info(log.get('new_value', ''))
+            if info:
+                if info.id not in group_states:
+                    group_states[info.id] = {'start': None, 'periods': [], 'info': info}
+                
+                # Only start if not already started
+                if group_states[info.id]['start'] is None:
+                    group_states[info.id]['start'] = parse_glpi_date(log['date_mod'])
 
+        elif action == GROUP_UNASSIGNED_ACTION:
+            info = extract_group_info(log.get('old_value', ''))
+            if info and info.id in group_states and group_states[info.id]['start']:
+                start = group_states[info.id]['start']
+                end = parse_glpi_date(log['date_mod'])
+                group_states[info.id]['periods'].append(AssignmentPeriod(start, end, end - start))
+                group_states[info.id]['start'] = None
 
-# ============================================================================
-# Time Calculation Engine
-# ============================================================================
-
-def calculate_group_time(logs: List[Dict[str, Any]], group_info: GroupInfo, verbose: bool = False) -> Tuple[datetime.timedelta, List[AssignmentPeriod]]:
-    """
-    Calculate total time a group spent assigned to a ticket.
-    
-    Args:
-        logs: Sorted list of log entries (chronological order)
-        group_info: Group to track
-        verbose: Print assignment history
-    
-    Returns:
-        (total_duration, list_of_periods)
-    """
-    total_duration = datetime.timedelta()
-    current_assignment_start = None
-    periods = []
-    
-    if verbose:
-        print(f"\n--- Assignment History: {group_info} ---")
-    
-    for log in logs:
-        date_mod = parse_glpi_date(log['date_mod'])
-        
-        # Assignment event
-        if is_assignment_log(log, group_info.id):
-            if current_assignment_start is None:  # Not already assigned
-                current_assignment_start = date_mod
-                if verbose:
-                    print(f"[{format_datetime(date_mod)}] Assigned")
-        
-        # Unassignment event
-        elif is_unassignment_log(log, group_info.id):
-            if current_assignment_start is not None:  # Was assigned
-                duration = date_mod - current_assignment_start
-                total_duration += duration
-                periods.append(AssignmentPeriod(
-                    assigned=current_assignment_start,
-                    unassigned=date_mod,
-                    duration=duration
-                ))
-                current_assignment_start = None
-                if verbose:
-                    print(f"[{format_datetime(date_mod)}] Unassigned (Duration: {duration})")
-    
-    # Handle still-assigned case
-    if current_assignment_start is not None:
-        now = get_current_time()
-        duration = now - current_assignment_start
-        total_duration += duration
-        periods.append(AssignmentPeriod(
-            assigned=current_assignment_start,
-            unassigned=now,
-            duration=duration,
-            still_assigned=True
-        ))
-        if verbose:
-            print(f"[{format_datetime(now)}] Still Assigned (Duration: {duration})")
-    
-    return total_duration, periods
-
-
-def calculate_all_groups(logs: List[Dict[str, Any]], verbose: bool = False) -> Dict[int, Dict[str, Any]]:
-    """
-    Calculate time for all groups in the logs.
-    
-    Returns:
-        Dictionary: {group_id: {'group_info': GroupInfo, 'total_duration': timedelta, 'periods': list}}
-    """
-    sorted_logs = sorted(logs, key=lambda x: x['date_mod'])
-    groups = get_all_groups_from_logs(sorted_logs)
-    
-    if verbose and groups:
-        print(f"\nFound {len(groups)} groups:")
-        for gid in sorted(groups.keys()):
-            print(f"  - {groups[gid]}")
-    
+    # Close open sessions
+    now = datetime.datetime.now().replace(microsecond=0)
     results = {}
-    for group_id in sorted(groups.keys()):
-        group_info = groups[group_id]
-        total_duration, periods = calculate_group_time(sorted_logs, group_info, verbose)
+    
+    for gid, state in group_states.items():
+        if state['start']:
+            duration = now - state['start']
+            state['periods'].append(AssignmentPeriod(state['start'], now, duration, still_assigned=True))
         
-        results[group_id] = {
-            'group_info': group_info,
-            'total_duration': total_duration,
-            'periods': periods,
-            'assignment_count': len(periods)
-        }
-    
-    return results
-
-
-# ============================================================================
-# Data Fetching
-# ============================================================================
-
-def fetch_ticket_logs(session_token: str, ticket_id: int) -> Optional[List[Dict[str, Any]]]:
-    """Fetch logs for a ticket. Returns None on error."""
-    logs, error = get_ticket_subitems(
-        GLPI_URL, session_token, ticket_id, "Log", 
-        app_token=APP_TOKEN, range_param='0-999'
-    )
-    
-    if error:
-        print(f"[ERROR] Ticket #{ticket_id}: {error}")
-        return None
-    
-    return logs
-
-
-# ============================================================================
-# Analysis Functions
-# ============================================================================
-
-def analyze_ticket(session_token: str, ticket_id: int, verbose: bool = True) -> Optional[Dict[int, Dict[str, Any]]]:
-    """
-    Analyze all groups for a single ticket.
-    
-    Returns:
-        Dictionary of results, or None if error
-    """
-    logs = fetch_ticket_logs(session_token, ticket_id)
-    if logs is None:
-        return None
-    
-    results = calculate_all_groups(logs, verbose)
-    
-    if verbose and results:
-        print_ticket_summary(ticket_id, results)
-    
-    return results
-
-
-def analyze_multiple_tickets(session_token: str, ticket_ids: List[int], verbose: bool = False) -> Dict[int, Dict[int, Dict[str, Any]]]:
-    """
-    Analyze multiple tickets and aggregate results.
-    
-    Returns:
-        {ticket_id: {group_id: {...}}}
-    """
-    print(f"\n{'=' * 90}")
-    print(f"Analyzing {len(ticket_ids)} tickets: {ticket_ids}")
-    print(f"{'=' * 90}")
-    
-    all_results = {}
-    group_aggregates = defaultdict(lambda: {
-        'total_duration': datetime.timedelta(),
-        'ticket_count': 0,
-        'assignment_count': 0,
-        'group_info': None
-    })
-    
-    for ticket_id in ticket_ids:
-        print(f"\n>>> Ticket #{ticket_id}")
-        results = analyze_ticket(session_token, ticket_id, verbose)
+        total_time = sum((p.duration for p in state['periods']), datetime.timedelta())
         
-        if results:
-            all_results[ticket_id] = results
-            
-            # Aggregate
-            for group_id, data in results.items():
-                group_aggregates[group_id]['total_duration'] += data['total_duration']
-                group_aggregates[group_id]['ticket_count'] += 1
-                group_aggregates[group_id]['assignment_count'] += data['assignment_count']
-                if group_aggregates[group_id]['group_info'] is None:
-                    group_aggregates[group_id]['group_info'] = data['group_info']
-    
-    # Print aggregate summary
-    if group_aggregates:
-        print_aggregate_summary(ticket_ids, group_aggregates)
-    
-    return all_results
-
-
-def analyze_ticket_range(session_token: str, start_id: int, end_id: int, verbose: bool = False) -> Dict[int, Dict[int, Dict[str, Any]]]:
-    """Analyze a range of ticket IDs."""
-    ticket_ids = list(range(start_id, end_id + 1))
-    print(f"Ticket range: {start_id} to {end_id} ({len(ticket_ids)} tickets)")
-    return analyze_multiple_tickets(session_token, ticket_ids, verbose)
-
-
-# ============================================================================
-# Display/Output Functions
-# ============================================================================
-
-def print_ticket_summary(ticket_id: int, results: Dict[int, Dict[str, Any]]) -> None:
-    """Print summary table for a single ticket."""
-    print("\n" + "=" * 90)
-    print(f"SUMMARY - Ticket #{ticket_id}")
-    print("=" * 90)
-    print(f"{'Group ID':<12} {'Group Name':<25} {'Assignments':<15} {'Total Time':<20}")
-    print("-" * 90)
-    
-    for group_id in sorted(results.keys()):
-        data = results[group_id]
-        print(f"{group_id:<12} {data['group_info'].name:<25} {data['assignment_count']:<15} {str(data['total_duration']):<20}")
-    
-    print("=" * 90)
-
-
-def print_aggregate_summary(ticket_ids: List[int], aggregates: Dict[int, Dict[str, Any]]) -> None:
-    """Print aggregate summary across multiple tickets."""
-    print("\n" + "=" * 100)
-    print(f"AGGREGATE SUMMARY - {len(ticket_ids)} Tickets")
-    print("=" * 100)
-    print(f"{'Group ID':<12} {'Group Name':<25} {'Tickets':<10} {'Assignments':<15} {'Total Time':<20}")
-    print("-" * 100)
-    
-    for group_id in sorted(aggregates.keys()):
-        data = aggregates[group_id]
-        print(f"{group_id:<12} {data['group_info'].name:<25} {data['ticket_count']:<10} {data['assignment_count']:<15} {str(data['total_duration']):<20}")
-    
-    print("=" * 100)
-
-
-def export_to_json(results: Dict[int, Dict[int, Dict[str, Any]]], filename: str = 'ticket_analysis.json') -> None:
-    """Export results to JSON file."""
-    export_data = {
-        'generated_at': datetime.datetime.now().isoformat(),
-        'tickets': {}
-    }
-    
-    for ticket_id, groups in results.items():
-        export_data['tickets'][ticket_id] = {}
-        
-        for group_id, data in groups.items():
-            export_data['tickets'][ticket_id][group_id] = {
-                'group_name': data['group_info'].name,
-                'total_duration_seconds': data['total_duration'].total_seconds(),
-                'total_duration_str': str(data['total_duration']),
-                'assignment_count': data['assignment_count'],
-                'periods': [p.to_dict() for p in data['periods']]
+        if state['periods']: # Only save if there was actual activity
+            results[gid] = {
+                'group_info': state['info'],
+                'total_duration': total_time,
+                'periods': state['periods'],
+                'assignment_count': len(state['periods'])
             }
-    
-    with open(filename, 'w') as f:
-        json.dump(export_data, f, indent=2)
-    
-    print(f"\n[EXPORT] Results saved to {filename}")
-
+            
+    return results
 
 # ============================================================================
-# Main Entry Point
+# Main Process
 # ============================================================================
 
-def main():
-    """Main execution function."""
+def sync_database(start_id: int = 1, end_id: int = 10000, batch_size: int = 50):
+    """
+    Main routine to scrape the database.
+    Resumes from last success, handles errors, saves to SQLite.
+    """
+    db = DatabaseManager()
+    
+    # Smart Resume: Check where we left off
+    last_id = db.get_max_processed_id()
+    if last_id >= start_id:
+        print(f"Found existing data. Resuming from Ticket #{last_id + 1}")
+        start_id = last_id + 1
+
+    print(f"Starting sync for range {start_id} to {end_id}...")
+
     try:
-        with GLPISession(GLPI_URL, USER, PASSWORD, APP_TOKEN) as session_token:
-            print(f"[AUTH] Session: {session_token}\n")
+        with GLPISession(GLPI_URL, USER, PASSWORD, APP_TOKEN) as session:
             
-            # Example 1: Single ticket analysis
-            print("=" * 90)
-            print("EXAMPLE 1: Single Ticket Analysis")
-            print("=" * 90)
-            analyze_ticket(session_token, TICKET_ID, verbose=True)
-            
-            # Example 2: Multiple specific tickets
-            print("\n\n" + "=" * 90)
-            print("EXAMPLE 2: Multiple Tickets Analysis")
-            print("=" * 90)
-            results = analyze_multiple_tickets(session_token, [1, 2, 3], verbose=False)
-            
-            # Example 3: Ticket range
-            print("\n\n" + "=" * 90)
-            print("EXAMPLE 3: Ticket Range Analysis")
-            print("=" * 90)
-            analyze_ticket_range(session_token, start_id=1, end_id=5, verbose=False)
-            
-            # Example 4: Export to JSON
-            if results:
-                export_to_json(results)
-            
-    except ConnectionError as e:
-        print(f"[ERROR] Connection: {e}")
-    except Exception as e:
-        print(f"[ERROR] Unexpected: {e}")
-        raise
+            for current_id in range(start_id, end_id + 1):
+                # Optional: Skip if already done (double check)
+                if db.is_ticket_processed(current_id):
+                    continue
 
+                print(f"Processing Ticket #{current_id}...", end="\r")
+                
+                # 1. Fetch Logs
+                logs, error = get_ticket_subitems(
+                    GLPI_URL, session, current_id, "Log", 
+                    app_token=APP_TOKEN, range_param='0-999'
+                )
+
+                if error:
+                    # If 404 or similar, it might just not exist, log and continue
+                    db.log_error(current_id, error)
+                    continue
+
+                # 2. Calculate
+                if logs:
+                    results = calculate_ticket_times(logs)
+                    # 3. Save
+                    db.save_results(current_id, results)
+                else:
+                    # Ticket exists but has no logs or empty response
+                    db.save_results(current_id, {})
+
+                # Rate limiting / Niceness
+                if current_id % batch_size == 0:
+                    print(f"Processed up to Ticket #{current_id} - Committing batch.")
+                    # SQLite commits on every save_results in this implementation, 
+                    # but this print helps user know progress.
+
+    except KeyboardInterrupt:
+        print("\nStopping sync... (Progress saved)")
+    except Exception as e:
+        print(f"\nCritical Error: {e}")
+    finally:
+        db.close()
+        print("\nDatabase connection closed.")
 
 if __name__ == "__main__":
-    main()
+    # Set your desired range here. 
+    # You can set end_id very high; the script logs errors for missing tickets.
+    sync_database(start_id=1, end_id=50)

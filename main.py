@@ -250,6 +250,42 @@ def calculate_ticket_times(logs: List[Dict]) -> Dict[int, Dict]:
             
     return results
 
+def get_current_assignments(logs: List[Dict]) -> Dict[int, Dict[str, Any]]:
+    """
+    Helper: Get only groups currently assigned to the ticket.
+    Calculates duration since the MOST RECENT assignment event.
+    Returns: {group_id: {'group_info': GroupInfo, 'duration': timedelta, 'assigned_at': datetime}}
+    """
+    logs.sort(key=lambda x: x['date_mod'])
+    active_groups = {}
+
+    for log in logs:
+        if log.get('itemtype_link') != 'Group': continue
+        action = int(log.get('linked_action', 0))
+
+        if action == GROUP_ASSIGNED_ACTION:
+            info = extract_group_info(log.get('new_value', ''))
+            if info:
+                # Always update to the latest assignment time
+                active_groups[info.id] = {'start': parse_glpi_date(log['date_mod']), 'info': info}
+        
+        elif action == GROUP_UNASSIGNED_ACTION:
+            info = extract_group_info(log.get('old_value', ''))
+            if info and info.id in active_groups:
+                del active_groups[info.id]
+
+    now = datetime.datetime.now().replace(microsecond=0)
+    results = {}
+    
+    for gid, data in active_groups.items():
+        results[gid] = {
+            'group_info': data['info'],
+            'duration': now - data['start'],
+            'assigned_at': data['start']
+        }
+            
+    return results
+
 # ============================================================================
 # Main Process
 # ============================================================================

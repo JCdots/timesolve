@@ -352,4 +352,4 @@ def sync_database(start_id: int = 1, end_id: int = 10000, batch_size: int = 50):
 if __name__ == "__main__":
     # Set your desired range here. 
     # You can set end_id very high; the script logs errors for missing tickets.
-    sync_database(start_id=1, end_id=50)
+    sync_database(start_id=19000, end_id=21200)

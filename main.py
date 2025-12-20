@@ -206,7 +206,31 @@ def calculate_ticket_times(logs: List[Dict]) -> Dict[int, Dict]:
     
     group_states = {} # {group_id: {'start': datetime, 'periods': [], 'info': GroupInfo}}
     
+    # Track solution time
+    solution_date = None
+    
     for log in logs:
+        # Check for status changes
+        # id_search_option 12 is Status
+        if str(log.get('id_search_option')) == '12':
+            new_status = str(log.get('new_value', ''))
+            current_date = parse_glpi_date(log['date_mod'])
+            
+            if new_status == '5': # Solved
+                solution_date = current_date
+            elif new_status == '6': # Closed
+                if solution_date is None:
+                    solution_date = current_date
+                # If already solved, keep the solved date as the solution date
+            else:
+                # Reopened or other status
+                solution_date = None
+
+        # Check for Solution being added directly (ITILSolution)
+        # linked_action 17 is ADD
+        if log.get('itemtype_link') == 'ITILSolution' and int(log.get('linked_action', 0)) == 17:
+             solution_date = parse_glpi_date(log['date_mod'])
+
         if log.get('itemtype_link') != 'Group': continue
         
         action = int(log.get('linked_action', 0))
@@ -230,13 +254,36 @@ def calculate_ticket_times(logs: List[Dict]) -> Dict[int, Dict]:
                 group_states[info.id]['start'] = None
 
     # Close open sessions
-    now = datetime.datetime.now().replace(microsecond=0)
+    # Determine the effective end time
+    # Use the last log date as the default end time (instead of now) to handle stale/closed tickets without explicit status change
+    last_log_date = None
+    if logs:
+        last_log_date = parse_glpi_date(logs[-1]['date_mod'])
+    
+    if not last_log_date:
+        last_log_date = datetime.datetime.now().replace(microsecond=0)
+
+    effective_end = last_log_date
+    if solution_date:
+        effective_end = solution_date
+
     results = {}
     
     for gid, state in group_states.items():
         if state['start']:
-            duration = now - state['start']
-            state['periods'].append(AssignmentPeriod(state['start'], now, duration, still_assigned=True))
+            # If the ticket is solved, use the solution date.
+            # Ensure we don't have negative duration if assignment happened after solution (weird case)
+            if solution_date and state['start'] > solution_date:
+                 end_time = max(state['start'], effective_end)
+            else:
+                 end_time = effective_end
+            
+            # Ensure end_time is not before start_time (sanity check)
+            if end_time < state['start']:
+                end_time = state['start']
+
+            duration = end_time - state['start']
+            state['periods'].append(AssignmentPeriod(state['start'], end_time, duration, still_assigned=True))
         
         total_time = sum((p.duration for p in state['periods']), datetime.timedelta())
         
@@ -352,4 +399,4 @@ def sync_database(start_id: int = 1, end_id: int = 10000, batch_size: int = 50):
 if __name__ == "__main__":
     # Set your desired range here. 
     # You can set end_id very high; the script logs errors for missing tickets.
-    sync_database(start_id=19000, end_id=21200)
+    sync_database(start_id=1, end_id=21200)
